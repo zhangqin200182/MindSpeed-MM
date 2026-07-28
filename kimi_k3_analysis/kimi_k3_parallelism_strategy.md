@@ -1,25 +1,40 @@
 # Kimi-K3 并行策略与资源配置指南
 
 > 分析日期: 2026-07-28
+> 数据来源: [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) config.json + safetensors 文件清单
 
 ---
 
 ## 1. 模型规模概览
 
+### 1.1 架构参数 (来自 config.json)
+
 | 参数 | 数值 | 说明 |
 |------|------|------|
-| Hidden Size | 7168 | 主隐藏维度 |
-| Routed Expert Hidden | 3584 | Latent MoE 压缩后的专家隐藏维度 |
-| Routed Expert Intermediate | 3072 | 专家 FFN 中间维度 |
-| Num Experts | 896 | 路由专家数 |
-| Top-K | 16 | 每个 token 激活的专家数 |
-| Shared Experts | 2 | 共享专家数 |
-| Shared Expert Intermediate | 6144 | 2×3072 |
-| Num Layers | ~48 | 包含 MLA + KDA 混合 attention |
-| KDA Head Dim (K/V) | 128 | Delta Attention 头维度 |
-| SiTU Beta / Linear Beta | 4.0 / 25.0 | 自定义激活参数 |
+| `hidden_size` | 7168 | 主隐藏维度 |
+| `num_hidden_layers` | **93** | 69 KDA + 24 MLA |
+| `num_attention_heads` | 96 | 注意力头数 |
+| `kv_lora_rank` | 512 | MLA KV 低秩压缩维度 |
+| `q_lora_rank` | 1536 | MLA Q 低秩压缩维度 |
+| `intermediate_size` | **33792** | Dense MLP 中间维度 |
+| `moe_intermediate_size` | 3072 | MoE Expert 中间维度 |
+| `num_experts` | 896 | 路由专家总数 |
+| `num_experts_per_token` | 16 | 每个 token 激活的专家数 |
+| `num_shared_experts` | 2 | 共享专家 |
+| `vocab_size` | **163840** | 词表大小 (16 万) |
+| `max_position_embeddings` | 1,048,576 | 最大上下文 1M |
+| `hidden_act` | `situ` | SiTU 自定义激活 (beta=4.0, linear_beta=25.0) |
+| KDA head_dim (K) | 128 | Delta Attention 头维度 |
+| KDA conv_kernel_size | 4 | ShortConvolution 核大小 |
 
-**模型总参数量估算**: ~45-50B (BF16 约 90-100GB)
+### 1.2 参数量与权重
+
+| 指标 | 数值 |
+|------|------|
+| 总参数量 | **2.78T** |
+| 激活参数量 (per token) | **~104B** |
+| 权重文件总大小 (BF16/MXFP mixed) | **1560 GB** (96 个 safetensors shard) |
+| 量化版本大小 (MXFP4) | **~594 GB** |
 
 ---
 
@@ -31,23 +46,23 @@ MindSpeed-MM 提供了以下可组合的并行策略：
 ┌─────────────────────────────────────────────────────┐
 │                  Kimi-K3 并行维度                      │
 │                                                     │
-│  FSDP2 (数据并行)                                     │
+│  FSDP2 (ZeRO-2 风格数据并行)                          │
 │    └─ fully_shard_parallel_size: auto               │
-│    └─ 参数/梯度/优化器分片到所有卡                       │
+│    └─ 参数/梯度/优化器状态均匀分片到所有卡                │
 │                                                     │
 │  EP (Expert Parallel)                               │
 │    └─ expert_parallel_size: N                       │
-│    └─ 896 experts 分到 N 个 EP 组                     │
+│    └─ 896 experts 分到 N 组, 每组 896/N experts      │
 │    └─ dispatcher: alltoall / allgather              │
 │                                                     │
 │  CP (Context Parallel)                              │
 │    └─ ulysses_parallel_size: N                      │
-│    └─ 长序列的注意力计算分到 N 个 CP 组                  │
-│    └─ Ring Attention (NPU FA2/FA3)                  │
+│    └─ 长序列 attention 计算切分                        │
+│    └─ Ring Attention (NPU FA2/FA3 only)             │
 │                                                     │
 │  显存优化 (辅助)                                      │
 │    └─ recompute (重计算)                              │
-│    └─ activation offload (激活 CPU 卸载)               │
+│    └─ activation offload (激活值 CPU 卸载)             │
 │    └─ chunk_loss / chunk_mbs (分块计算)                │
 └─────────────────────────────────────────────────────┘
 ```
@@ -56,104 +71,130 @@ MindSpeed-MM 提供了以下可组合的并行策略：
 
 所有场景都需要。参数、梯度、优化器状态均匀分片到所有卡。
 
-```yaml
-parallel:
-  fully_shard_parallel_size: auto   # 自动计算
-```
-
 ### 2.2 EP (Expert Parallel, 必选)
 
-896 个 expert 需要 EP 切分，否则单卡放不下。EP 组内的卡各持有 `896 / expert_parallel_size` 个 expert。
+896 个 expert, 每个约 22M 参数 (3584×3072×2), 不切分单卡放不下。EP 组内每卡持有 `896 / expert_parallel_size` 个 expert。
 
-```yaml
-parallel:
-  expert_parallel_size: 4   # 或 8
-  ep_plan:
-    apply_modules:
-      - language_model.model.layers.{*}.block_sparse_moe.experts
-    dispatcher: alltoall     # EP > topk(16) 时推荐
-    use_npu_fused_ops: true
-```
-
-dispatcher 选择：
-- `expert_parallel_size > topk(16)` → `alltoall` (推荐)
-- `expert_parallel_size < topk(16)` → `allgather`
+dispatcher 选择规则:
+- `expert_parallel_size > topk(16)` → `alltoall` (推荐, 通信量更小)
+- `expert_parallel_size < topk(16)` → `allgather` (每卡需要完整 token 集)
 
 ### 2.3 CP (Context Parallel, 长序列时推荐)
 
-当 `cutoff_len > 4096` 时建议开启，缓解 attention 计算的显存压力。
-
-```yaml
-parallel:
-  ulysses_parallel_size: 2   # 或更大
-```
+`cutoff_len > 4096` 时建议开启。减少每个 attention head 处理的序列长度, 从而降低激活显存。
 
 ---
 
-## 3. 推荐部署配置
+## 3. 资源配置
+
+### 3.0 显存分析基础
+
+**单卡放权重的下限计算** (不考虑优化器):
+
+```
+BF16 权重总量: 1560 GB
+MXFP4 量化权重: 594 GB
+
+单卡仅放权重 (BF16):
+  64GB 卡: 1560 / 64 ≈ 25 卡
+  128GB 卡: 1560 / 128 ≈ 13 卡
+
+单卡仅放权重 (MXFP4):
+  64GB 卡: 594 / 64 ≈ 10 卡
+```
+
+训练需要额外存放优化器状态 (AdamW: 参数 × 3 × 4 bytes ≈ 参数 × 12 bytes) 和梯度 + 激活值, 所需的卡数远多于纯推理。
 
 ### 3.1 全量微调 (Full Fine-tuning)
 
-**场景**: 最大训练能力，全部参数参与训练
+**场景**: 全部 ~2.78T 参数参与训练, BF16 混合精度
 
-| 平台 | EP | 每节点卡数 | 最少节点 | 总卡数 | 备注 |
-|------|:--:|:--:|:--:|:--:|------|
-| **A5 (950, 128GB)** | 4 | 8 | 2 | 16 | 示例配置，EP=4 |
-| **A3 (910_93, 64GB)** | 8 | 8 | 2 | 16 | 需开启重计算+CPU卸载 |
-| **A2 (910B, 64GB)** | 8 | 8 | 4 | 32 | 需开启全部显存优化 |
+**单卡显存逐项估算** (以 A2 64GB 为例):
 
-**A2 推荐配置** (`kimik3_config.yaml`):
+| 项目 | 公式 | 32 卡 (EP=8) | 64 卡 (EP=16) | 128 卡 (EP=16) |
+|------|------|:--:|:--:|:--:|
+| Expert 权重 | `1560 × (896/EP) / 896 / DP` GB | 49 / 4 = 12.2 | 23 / 4 = 5.7 | 23 / 8 = 2.9 |
+| 非 Expert 权重 | `~60 / total_cards` GB | 1.9 | 0.9 | 0.5 |
+| 优化器状态 | `~2 × 权重` GB (FSDP2 shard) | 28.2 | 13.2 | 6.8 |
+| 梯度 | `~1 × 权重` GB | 14.1 | 6.6 | 3.4 |
+| 激活值 | 重计算+卸载后 | ~15 | ~10 | ~8 |
+| **合计** | | **~71.4 GB** ❌ | **~36.4 GB** ✅ | **~21.6 GB** ✅ |
+
+> 注: 实际显存分布受 FSDP2 sharding plan、EP group topology、micro_batch_size 影响, 以上为数量级估算。
+
+**结论**:
+
+| 平台 | 最少卡数 | 推荐卡数 | EP | 每节点×节点 |
+|------|:--:|:--:|:--:|------|
+| **A2 (64GB)** | **64** | 128 | 16 | 8×8 或 8×16 |
+| **A3 (64GB)** | **64** | 64 | 16 | 8×8 |
+| **A5 (128GB)** | **32** | 64 | 8 | 8×4 或 8×8 |
+
+> ⚠️ **A2 单卡 64GB 在 EP=8 时显存约 71GB, 放不下!** 需要 EP≥16 或 开启 CPU offload + chunk_mbs 等全部优化。32 卡 A2 全量微调不可行。
+
+**A2 推荐配置** (64 卡):
 
 ```yaml
 parallel:
   fully_shard_parallel_size: auto
-  expert_parallel_size: 8          # A2 显存紧张, EP 切大点
-  ulysses_parallel_size: 1         # 短序列可关闭
+  expert_parallel_size: 16
   ep_plan:
-    apply_modules:
-      - language_model.model.layers.{*}.block_sparse_moe.experts
     dispatcher: alltoall
     use_npu_fused_ops: true
 
 training:
   micro_batch_size: 1
-  gradient_accumulation_steps: 16   # 增大 GA 补偿小 microbatch
+  gradient_accumulation_steps: 16
 
 features:
-  recompute: true                   # 必须开启
-  enable_activation_offload: true    # 必须开启
-  enable_chunk_loss: true           # 推荐
-  enable_chunk_mbs: true            # 推荐
-  chunkmbs_plan:
-    chunk_mbs: 1
+  recompute: true
+  enable_activation_offload: true
+  enable_chunk_loss: true
+  enable_chunk_mbs: true      # 必须, 减少激活值尖刺
 
 model:
-  skip_flash_attn_recompute: true   # 跳过 FA 重计算
-  skip_kda_recompute: true          # 跳过 KDA 重计算
-  use_grouped_expert_matmul: true   # NPU 融合 MoE
+  skip_flash_attn_recompute: true
+  skip_kda_recompute: true
+  use_grouped_expert_matmul: true
 ```
-
-**A2 单卡显存估算** (EP=8, FSDP2 32 卡):
-
-| 项目 | 大小 |
-|------|------|
-| Expert 权重 (112 experts, BF16) | ~5 GB |
-| 非 Expert 权重 (BF16) | ~3 GB |
-| 优化器状态 (AdamW fp32) | ~24 GB |
-| 梯度 + 激活值 (已开重计算) | ~15 GB |
-| **合计** | **~47 GB < 64 GB** ✅ |
 
 ### 3.2 LoRA 微调
 
-**场景**: 仅训练小量 adapter，base 模型冻结
+**场景**: 仅训练 LoRA adapter (~200M 参数), base 模型 2.78T 冻结
 
-| 平台 | EP | 每节点卡数 | 最少节点 | 总卡数 | 备注 |
-|------|:--:|:--:|:--:|:--:|------|
-| **A2/A3/A5** | 4 | 8 | 1 | 8 | 激活占用是瓶颈 |
+**关键差异**: 
+- 冻结权重不需要优化器状态
+- 优化器仅用于 LoRA 参数 (~200M × 12 bytes ≈ 2.4GB, 可忽略)
+- 主要瓶颈: 前向/反向的激活显存 + base 权重读取
+
+**单卡显存估算** (A2):
+
+| 项目 | 16 卡 (EP=4) | 32 卡 (EP=8) |
+|------|:--:|:--:|
+| Base 权重 (FSDP2 分片) | ~97 GB / 16 ≈ 6.1 | ~97 GB / 32 ≈ 3.0 |
+| Expert 权重 (EP 分片) | ~50 GB / 4 ≈ 12.5 | ~50 GB / 8 ≈ 6.25 |
+| 激活值 (重计算+卸载后) | ~20 | ~12 |
+| LoRA 优化器 | ~0.2 | ~0.2 |
+| **合计** | **~38.8 GB** ✅ | **~21.5 GB** ✅ |
+
+> Expert 权重和 base 权重的拆分: 896 experts 的 gate_up + down 约 2.6T 参数, 其余 (attention, embedding, shared, lm_head, norm) 约 0.18T。Expert 由 EP 分片, 其余由 FSDP2 分片。
+
+**结论**:
+
+| 平台 | 最少卡数 | 推荐卡数 | EP | 备注 |
+|------|:--:|:--:|:--:|------|
+| **A2 (64GB)** | **16** | 32 | 4 | 需 LoRA 功能适配 (见开发方案) |
+| **A3 (64GB)** | 16 | 16 | 4 | |
+| **A5 (128GB)** | 8 | 8 | 4 | |
+
+> ⚠️ **我之前估算的 A2 8 卡 LoRA 是错误的。** 激活值 + Expert 权重在 EP=4 时已达 38.8GB, 8 卡意味着 expert 权重翻倍 ~25GB, 加上激活值 20GB, 合计 ~48GB — 边界, 需要非常激进的优化才能跑。
+
+**A2 LoRA 推荐配置** (32 卡):
 
 ```yaml
 parallel:
-  expert_parallel_size: 4           # LoRA 场景 EP 可减小
+  fully_shard_parallel_size: auto
+  expert_parallel_size: 8
   ep_plan:
     dispatcher: alltoall
     use_npu_fused_ops: true
@@ -163,119 +204,54 @@ training:
     enable: true
     rank: 8
     alpha: 16
-    target_modules:
-      - "language_model.model.layers.{*}.self_attn.q_a_proj"
-      - "language_model.model.layers.{*}.self_attn.q_b_proj"
-      - "language_model.model.layers.{*}.self_attn.kv_a_proj_with_mqa"
-      - "language_model.model.layers.{*}.self_attn.kv_b_proj"
-      - "language_model.model.layers.{*}.self_attn.o_proj"
-      - "language_model.model.layers.{*}.self_attn.q_proj"
-      - "language_model.model.layers.{*}.self_attn.k_proj"
-      - "language_model.model.layers.{*}.self_attn.v_proj"
+    target_modules:  # 见 LoRA 开发方案文档
 
 features:
   recompute: true
   enable_activation_offload: true
+  enable_chunk_mbs: true
 ```
-
-> **注意**: LoRA 功能当前为实验特性，Kimi-K3 的 LoRA 适配需参考 [`kimi_k3_lora_development.md`](kimi_k3_lora_development.md)。
 
 ### 3.3 推理 (vllm-ascend)
 
-**场景**: 在线推理服务
+**场景**: 在线推理服务, MXFP4 量化权重 ~594 GB
 
-| 平台 | EP | 最少总卡数 | 量化 | 备注 |
-|------|:--:|:--:|------|------|
-| **A2/A3** | 64 | 64 | W4A8 INT8 | 896/14=64 卡, 每卡 14 experts |
-| **A5** | 64 | 64 | W4A8 MXFP8 | 同上 |
+| 平台 | EP | 最少总卡数 | 单卡显存占用 | 备注 |
+|------|:--:|:--:|:--:|------|
+| **A2 (64GB)** | 64 | **64** | `594/64 + KV Cache ≈ 9.3 + ~30 = ~39 GB` | EP=64 硬约束 |
+| **A3 (64GB)** | 64 | 64 | 同上 | |
+| **A5 (128GB)** | 64 | 64 | `594/64 + KV Cache ≈ 9.3 + ~60 = ~69 GB` | KV Cache 余量更大 |
 
-```bash
-vllm serve moonshotai/Kimi-K3 \
-  --tensor-parallel-size 1 \
-  --data-parallel-size 1 \
-  --expert-parallel-size 64 \
-  --max-model-len 32768 \
-  --gpu-memory-utilization 0.9
-```
-
-> EP=64 是推理的最低要求。896 个 expert / 14 个 per card = 64 卡。
+> EP=64 是推理的最低要求。896 experts / 14 per card = 64 卡。MQFP4 量化权重 594GB, 64 卡每卡 ~9.3GB。剩余空间用于 KV cache + KDA recurrent states + Conv states。
 
 ---
 
-## 4. 资源需求汇总
+## 4. 资源需求汇总 (修正版)
 
-| 场景 | 最小卡数 (A2) | 推荐卡数 (A2) | 关键约束 |
+| 场景 | A2 最小 | A2 推荐 | A3 最小 | A5 最小 | 关键约束 |
+|------|:--:|:--:|:--:|:--:|------|
+| **全量微调** | **64** | 128 | **64** | **32** | EP≥16(A2), EP≥8(A5) |
+| **LoRA 微调** | **16** | 32 | **16** | **8** | EP≥4, 需重计算+卸载 |
+| **推理** | **64** | 128 | **64** | **64** | EP=64 硬约束 |
+
+### 4.1 与之前估算的差异
+
+| 项目 | 之前估算 | 修正后 | 偏差原因 |
 |------|:--:|:--:|------|
-| **全量微调** | 32 (4 节点×8) | 64 (8 节点×8) | 需开启重计算+CPU卸载+chunk_loss |
-| **LoRA 微调** | 8 (1 节点×8) | 16 (2 节点×8) | 需开启重计算+CPU卸载 |
-| **推理** | 64 (8 节点×8) | 128 (16 节点×8) | EP=64 硬约束 |
-
-### 4.1 为什么 A2 全量微调最少 32 卡？
-
-```
-EP=8: Expert 权重切分到 8 卡, 每卡 112 experts ≈ 5GB
-FSDP2: 非 expert 参数在 EP 组内再切分
-  优化器状态: ~200GB / 32 卡 ≈ 6.25GB/卡
-  梯度: ~100GB / 32 卡 ≈ 3.1GB/卡
-  激活值: ~15GB/卡 (开重计算+CPU卸载)
-  ─────────────────
-  合计: 5 + 3 + 6.25 + 3.1 + 15 ≈ 32.4GB < 64GB ✅
-```
-
-如果只用 16 卡 (EP=4):
-```
-  Expert 权重: 224 experts ≈ 10GB
-  优化器: ~200GB / 16 卡 ≈ 12.5GB/卡
-  梯度: ~100GB / 16 卡 ≈ 6.25GB/卡
-  激活值: ~15GB/卡
-  ─────────────────
-  合计: 10 + 3 + 12.5 + 6.25 + 15 ≈ 46.75GB — 边界，需更激进优化
-```
-
-### 4.2 为什么推理 EP=64 是硬约束？
-
-- 896 experts，每个 expert 的权重约 22M 参数 (W4A8 量化后约 5.5MB)
-- 每卡放 14 个 experts: 14 × 5.5 ≈ 77MB — 完全可以
-- 但非 expert 权重 (attention, embedding, shared) 较大，需 EP=64 来分摊 KV Cache
-- EP=32 时每卡 28 experts，KV Cache 可用空间减半，max_model_len 会受限制
+| 全量微调 A2 最少 | 32 | **64** | 之前用的 ~48 layers / 50B params, 实际 93 layers / 2.78T params |
+| LoRA A2 最少 | 8 | **16** | 之前低估了激活值 + 93 层 attention 的显存 |
+| 权重大小 | ~100 GB | **1560 GB** | 之前把 active params 当成了 total params |
+| dense MLP intermediate | ~3072 | **33792** | 之前没拿到真实 config |
+| vocab_size | ~128K | **163840** | embedding/lm_head 比预期大 27% |
 
 ---
 
-## 5. 循序渐进部署路线
+## 5. 之前其他文档中的修正项
 
-```
-第 1 步: A5 验证
-  └─ 16 卡, EP=4, 跑通全量微调, 验证 loss 收敛
-
-第 2 步: A3 对齐
-  └─ 16 卡, EP=8, 开启重计算+CPU卸载, 验证精度对齐 A5
-
-第 3 步: A2 对齐
-  └─ 32 卡, EP=8, 全部显存优化开启, 验证精度对齐
-
-第 4 步: A2 LoRA
-  └─ 8 卡, EP=4, 跑通 LoRA 微调, 验证 loss 收敛
-
-第 5 步: A2 推理
-  └─ 64 卡, EP=64, 跑通 vllm-ascend 推理服务
-```
-
----
-
-## 6. 环境变量
-
-训练启动前确保设置:
-
-```bash
-# CANN 任务队列优化
-export TASK_QUEUE_ENABLE=1
-
-# HCCL 超时 (多机必须)
-export HCCL_CONNECT_TIMEOUT=1800
-
-# 虚拟内存 (大模型推荐)
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-
-# Triton 编译缓存 (避免反复编译)
-export TRITON_ALWAYS_COMPILE=0
-```
+| 文档 | 需要修正的内容 |
+|------|------|
+| `kimi_k3_npu_operators.md` | 无 (算子分析不涉及资源估算) |
+| `kimi_k3_npu_operators_comparison.md` | 无 (算子对比) |
+| `kimi_k3_npu_operators_alignment.md` | 1.3 节: A2 全量微调最少 64 卡 (原写 16) |
+| `kimi_k3_lora_development.md` | 4.3 节: A2 LoRA 最少 16 卡 (原写 8) |
+| `kimi_k3_cann_operators.md` | 无 (算子依赖) |

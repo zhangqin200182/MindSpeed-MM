@@ -401,15 +401,29 @@ torchrun --nproc_per_node=8 \
 
 这些层参数不大 (7168×3584 ≈ 25M), 可加 LoRA 也可不加。取决于需求。
 
-### 4.3 A2 平台卡数
+### 4.3 平台卡数要求 (基于真实模型规模)
 
-基于之前的分析, LoRA 微调下:
+Kimi-K3 真实参数规模 (来自 HuggingFace config.json):
+- 总参数: 2.78T, 激活参数: ~104B
+- 93 层 (69 KDA + 24 MLA), hidden_size=7168
+- BF16 权重: 1560 GB
 
-- Expert 权重冻结, 不需要 optimizer states
-- 仅 LoRA adapter 参数需要 optimizer states (~rank × 层数 × hidden × 4, 约 10-50M 参数)
-- 显存主要占用: frozen base weights (FSDP2 分片) + activations
+LoRA 微调下的单卡显存估算 (A2 64GB):
 
-**LoRA 微调在 A2 上最少需要 8 张卡** (EP=4 + FSDP2 数据分片 2 组), 比全量微调的 16+ 张显著减少。如果使用 EP=8 可以进一步降到 8 卡 (无额外数据并行)。
+| 项目 | 16 卡 (EP=4) | 32 卡 (EP=8) |
+|------|:--:|:--:|
+| Expert 权重 (EP 分片) | ~12.5 GB | ~6.25 GB |
+| 非 Expert 权重 (FSDP2 分片) | ~6.1 GB | ~3.0 GB |
+| 激活值 (重计算+CPU卸载后) | ~20 GB | ~12 GB |
+| LoRA 优化器 | ~0.2 GB | ~0.2 GB |
+| **合计** | **~38.8 GB** ✅ | **~21.5 GB** ✅ |
+
+**LoRA 微调最少需要**:
+- A2: **16 卡** (EP=4), 推荐 32 卡
+- A3: **16 卡** (EP=4), 推荐 16 卡
+- A5: **8 卡** (EP=4), 推荐 8 卡
+
+> ⚠️ 8 卡 A2 放不下 — Expert 权重 ~25GB + 激活 ~20GB + 非 Expert ~12GB ≈ 57GB, 边界风险。建议至少 16 卡。
 
 ### 4.4 FP32 LoRA 参数精度
 

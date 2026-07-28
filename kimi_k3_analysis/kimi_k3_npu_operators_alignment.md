@@ -69,11 +69,17 @@ this->AICore().AddConfig("ascend910b", aicoreConfig);   // kda_gate_cumsum_def.c
 
 | 项目 | 要求 | 说明 |
 |------|------|------|
-| 卡数 | **≥ 64 张** (EP=64) | Expert Parallelism 切分 896 个 expert |
-| 单卡 HBM | 64 GB (910B) / 64 GB (910_93) | W4A8 量化后足够；非量化需更多 |
+| 卡数 (推理) | **≥ 64 张** (EP=64) | 896 experts / 14 per card = 64 |
+| 卡数 (全量微调) | A2: **≥ 64 张** (EP=16) / A5: **≥ 32 张** (EP=8) | 模型 2.78T 参数, BF16 权重 1560 GB |
+| 卡数 (LoRA 微调) | A2: **≥ 16 张** (EP=4) / A5: **≥ 8 张** | LoRA 冻结 base, 只训练 ~200M adapter |
+| 单卡 HBM | 64 GB (910B/910_93) / 128 GB (950) | 详见并行策略文档 |
 | KDA 约束 | `K=V=128`, `chunk_size=64` | 三平台一致 |
+| 模型规模 | 93 层, 2.78T total / ~104B active | 69 KDA + 24 MLA, vocab_size=163840 |
 
 A2 跑 Kimi-K3 推理算子层面无 blocker，与 A3 在精度特性上完全等价（共享 `arch32` 二进制）。以下章节的精度分析和修改建议对 A2/A3 均适用。
+
+
+> 详细资源配置参见 [`kimi_k3_parallelism_strategy.md`](kimi_k3_parallelism_strategy.md)。
 
 ---
 
