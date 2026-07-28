@@ -197,6 +197,63 @@ vllm-ascend:
 **C. 共享的 torch_npu 算子 (3 个完全一致)**:
 - `npu_swiglu`
 - `npu_grouped_matmul`
+
+---
+
+## 5. 平台兼容性 (A2 / A3 / A5)
+
+### 5.1 训练算子 (MindSpeed-MM)
+
+| 算子 | 来源 | A2 (`910B`) | A3 (`910_93`) | A5 (`950`) | 说明 |
+|------|------|:---:|:---:|:---:|------|
+| `npu_rms_norm` | torch_npu | ✅ | ✅ | ✅ | CANN 通用 API |
+| `npu_fusion_attention` | torch_npu | ✅ | ✅ | ✅ | CANN 通用 API |
+| `npu_rotary_mul` | torch_npu | ✅ | ✅ | ✅ | CANN 通用 API |
+| `npu_swiglu` | torch_npu | ✅ | ✅ | ✅ | CANN 通用 API |
+| `npu_gelu` | torch_npu | ✅ | ✅ | ✅ | CANN 通用 API |
+| `npu_moe_token_permute` | torch_npu | ✅ | ✅ | ✅ | CANN 通用 API |
+| `npu_moe_token_unpermute` | torch_npu | ✅ | ✅ | ✅ | CANN 通用 API |
+| `npu_grouped_matmul` | torch_npu | ✅ | ✅ | ✅ | CANN 通用 API |
+| `npu_alltoallv_gmm` | torch_npu | ✅ | ✅ | ✅ | CANN 通用 API |
+| `npu_gmm_alltoallv` | torch_npu | ✅ | ✅ | ✅ | CANN 通用 API |
+| `chunk_kda` (fused) | `triton_ascend_kernels` | ✅ | ✅ | ✅ | Triton-Ascend 后端, CHIP_TYPE=910b/A3/A5 |
+| `causal_conv1d` (AscendC) | `fla_npu` | ✅ | ✅ | ✅ | AscendC arch32/35 |
+
+**外部依赖的平台要求**:
+
+- **`torch_npu`** (CANN): 所有 10 个算子均为 CANN 通用 API，与 SoC 平台无关。A2/A3/A5 均可使用，只需安装对应平台的 CANN 版本即可。
+- **`Triton-Ascend`** + **`triton-ascend-kernels`**: `chunk_kda` 融合大算子的运行时。Triton-Ascend 支持 A2 (910B) / A3 (910_93) / A5 (950)，通过 `CHIP_TYPE` 编译选项选择目标平台。A2 设置 `CHIP_TYPE=910b`。
+- **`fla_npu`**: `causal_conv1d` 的 AscendC 实现。AscendC 的 `arch32` 编译目标同时覆盖 A2 和 A3，与 vllm-ascend 中的 `AddConfig("ascend910b")` 一致。
+
+> **结论**: 训练侧所有 12 个算子均支持 A2/A3/A5 三平台。唯一的平台差异是需要安装对应 SoC 版本的 CANN、Triton-Ascend 和 fla_npu 包。
+
+### 5.2 推理算子 (vllm-ascend)
+
+| 算子 | 来源 | A2 | A3 | A5 | 说明 |
+|------|------|:---:|:---:|:---:|------|
+| `chunk_kda_fwd` | `_C_ascend` (AscendC) | ✅ | ✅ | ✅ | arch32/35 |
+| `kda_gate_cumsum` | `_C_ascend` (AscendC) | ✅ | ✅ | ✅ | arch32/35 |
+| `recurrent_kda` | `_C_ascend` (AscendC) | ✅ | ✅ | ✅ | 公共 AIV kernel |
+| `npu_causal_conv1d_custom` | `_C_ascend` (AscendC) | ✅ | ✅ | ✅ | 已有复用算子 |
+| `dequant_situ_quant` | `_C_ascend` (AscendC) | ✅ | ✅ | ❌ | A2/A3 INT8 路径 |
+| `situ_mx_quant` | `_C_ascend` (AscendC) | ❌ | ❌ | ✅ | A5 专用 MXFP8 |
+| `npu_swiglu` 等共享算子 | torch_npu | ✅ | ✅ | ✅ | CANN 通用 API |
+
+### 5.3 训练 vs 推理平台差异
+
+```
+训练 (MindSpeed-MM):
+  A2 ✅ 全算子支持 (12/12)
+  A3 ✅ 全算子支持 (12/12)
+  A5 ✅ 全算子支持 (12/12)
+  关键依赖: CANN + Triton-Ascend (CHIP_TYPE) + fla_npu
+
+推理 (vllm-ascend):
+  A2 ✅ KDA 全支持, SiTU 走 dequant_situ_quant (INT8)
+  A3 ✅ KDA 全支持, SiTU 走 dequant_situ_quant (INT8)
+  A5 ✅ KDA 全支持, SiTU 走 situ_mx_quant (FP8)
+  关键依赖: CANN + 自研 AscendC 算子编译 (arch32/35)
+```
 - `npu_moe_token_permute` / `npu_moe_token_unpermute`
 - `npu_fusion_attention`
 - `npu_rms_norm`
