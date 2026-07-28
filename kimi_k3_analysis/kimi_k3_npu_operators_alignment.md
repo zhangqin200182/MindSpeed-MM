@@ -67,19 +67,20 @@ this->AICore().AddConfig("ascend910b", aicoreConfig);   // kda_gate_cumsum_def.c
 
 **硬件限制**：
 
+> ⚠️ HuggingFace Kimi-K3 checkpoint 的 Expert 权重为 MXFP4 格式。A2/A3 不支持 MXFP4 原生计算，加载时需反量化 MXFP4→BF16 (4×膨胀)。
+
 | 项目 | 要求 | 说明 |
 |------|------|------|
-| 卡数 (推理) | **≥ 64 张** (EP=64) | 896 experts / 14 per card = 64 |
-| 卡数 (全量微调) | A2: **≥ 64 张** (EP=16) / A5: **≥ 32 张** (EP=8) | 模型 2.78T 参数, BF16 权重 1560 GB |
-| 卡数 (LoRA 微调) | A2: **≥ 16 张** (EP=4) / A5: **≥ 8 张** | LoRA 冻结 base, 只训练 ~200M adapter |
-| 单卡 HBM | 64 GB (910B/910_93) / 128 GB (950) | 详见并行策略文档 |
+| 卡数 (推理) | **≥ 64 张** (EP=64) | A2/A3 可使用量化推理 (W4A8) |
+| 卡数 (全量微调, A2/A3) | ❌ 不可行 | MXFP4→BF16 反量化 + 优化器 = 单卡爆炸 |
+| 卡数 (全量微调, A5) | **≥ 256 张** (EP=256) | A5 原生 MXFP4, 无需反量化 |
+| 卡数 (LoRA, A2/A3) | **≥ 128 张** (EP=128) | base 冻结, Expert 权重仍需 BF16 前向 |
+| 卡数 (LoRA, A5) | **≥ 16 张** (EP=8) | A5 可用 MXFP4 权重 |
+| 单卡 HBM | 64 GB (910B/910_93) / 128 GB (950) | — |
 | KDA 约束 | `K=V=128`, `chunk_size=64` | 三平台一致 |
-| 模型规模 | 93 层, 2.78T total / ~104B active | 69 KDA + 24 MLA, vocab_size=163840 |
+| 模型规模 | 93 层, 2.78T total / ~104B active | 69 KDA + 24 MLA |
 
 A2 跑 Kimi-K3 推理算子层面无 blocker，与 A3 在精度特性上完全等价（共享 `arch32` 二进制）。以下章节的精度分析和修改建议对 A2/A3 均适用。
-
-
-> 详细资源配置参见 [`kimi_k3_parallelism_strategy.md`](kimi_k3_parallelism_strategy.md)。
 
 ---
 
